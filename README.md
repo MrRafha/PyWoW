@@ -28,6 +28,8 @@ python run_servers.py
 
 Log in with username `TEST` and password `TEST`.
 
+Hosting for friends? See [docs/DEPLOY.md](docs/DEPLOY.md) (home server + Tailscale, systemd, backups — in Portuguese).
+
 ## Running the tests
 
 ```bash

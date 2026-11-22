@@ -1,0 +1,16 @@
+[Unit]
+Description=PyWoW (WoW 3.3.5a auth + world server)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=SEU_USUARIO
+WorkingDirectory=/home/SEU_USUARIO/pywow
+ExecStart=/home/SEU_USUARIO/pywow/.venv/bin/python run_servers.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
