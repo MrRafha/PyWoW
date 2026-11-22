@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS item_templates(
   lock_id INTEGER NOT NULL DEFAULT 0,
   material INTEGER NOT NULL DEFAULT 0,
   sheath_type INTEGER NOT NULL DEFAULT 0,
+  buy_count INTEGER NOT NULL DEFAULT 1,
   random_property INTEGER NOT NULL DEFAULT 0,
   random_suffix INTEGER NOT NULL DEFAULT 0,
   block INTEGER NOT NULL DEFAULT 0,
@@ -397,6 +398,12 @@ def init_character_db(path: str) -> None:
             con.execute("ALTER TABLE characters ADD COLUMN xp INTEGER NOT NULL DEFAULT 0")
         if "money" not in columns:
             con.execute("ALTER TABLE characters ADD COLUMN money INTEGER NOT NULL DEFAULT 0")
+        item_columns = {row[1] for row in con.execute("PRAGMA table_info(item_templates)")}
+        if "buy_count" not in item_columns:
+            # Vendors sell some items in fixed bundles (water x5, arrows x200).
+            con.execute(
+                "ALTER TABLE item_templates ADD COLUMN buy_count INTEGER NOT NULL DEFAULT 1"
+            )
         _migrate_start_positions(con)
         _seed_starter_items(con)
         _backfill_starter_spells(con)
@@ -1211,7 +1218,7 @@ def add_item_to_inventory(path: str, character_guid: int, entry: int,
         remaining = max(1, int(count))
 
         rows = con.execute(
-            "SELECT id, slot, stack_count FROM character_items "
+            "SELECT id, slot, stack_count, item_entry FROM character_items "
             "WHERE character_guid = ?",
             (character_guid,),
         ).fetchall()
@@ -1219,7 +1226,9 @@ def add_item_to_inventory(path: str, character_guid: int, entry: int,
 
         changes: List[Dict] = []
         if stackable > 1:
-            for item_id, slot, stack_count in rows:
+            for item_id, slot, stack_count, item_entry in rows:
+                if int(item_entry) != int(entry):
+                    continue                # only top up stacks of the same item
                 slot = int(slot)
                 if not (256 <= slot <= 271):
                     continue

@@ -31,6 +31,7 @@ from src.world.worldsocket.player_movement import PlayerMovementMixin
 from src.world.worldsocket.runes import RunesMixin
 from src.world.worldsocket.spells import SpellsMixin
 from src.world.worldsocket.stats import StatsMixin
+from src.world.worldsocket.vendors import VendorsMixin
 from src.world.worldsocket.world_entry import WorldEntryMixin
 
 __all__ = ["WorldSocket", *_CONSTANT_NAMES]
@@ -53,5 +54,6 @@ class WorldSocket(
     CreatureMovementMixin,
     LootMixin,
     InventoryMixin,
+    VendorsMixin,
 ):
     """One connected 3.3.5a client; see the mixins for each subsystem."""

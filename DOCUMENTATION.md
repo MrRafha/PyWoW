@@ -87,6 +87,16 @@ A real 3.3.5a client can now log in, pick a character and **enter the world**:
 - Loot is rolled exactly once when the creature dies, stored in `creature_spawns.loot_json`
 - `CMSG_LOOT`, `CMSG_AUTOSTORE_LOOT_ITEM`, `CMSG_LOOT_MONEY`, `CMSG_LOOT_RELEASE`
 
+### Vendors
+- `npc_vendor` (35,910 rows for 1,982 vendors) imported from CMaNGOS `npc_vendor` plus the shared `npc_vendor_template` lists, and `item_templates.buy_count` (water and food come in bundles of 5, ammo in 200s)
+- `CMSG_LIST_INVENTORY` -> `SMSG_LIST_INVENTORY`; gossip vendors open the list straight away, or get a "browse your goods" option added to their menu; CMaNGOS gossip options of type vendor open it too
+- `CMSG_BUY_ITEM` / `CMSG_BUY_ITEM_IN_SLOT` -> `SMSG_BUY_ITEM` / `SMSG_BUY_FAILED` (not enough money, sold out, wrong slot, too far); items go to the backpack and stack with copies already there
+- Limited stock (`maxcount`/`incrtime`) per spawn, refilled after `incrtime` seconds
+- `CMSG_SELL_ITEM` for backpack items at `sell_price`, whole or partial stacks
+- Hidden from the list: other-faction items and bind-on-pickup gear for other classes
+- Not implemented yet: honor/token prices (`ExtendedCost`, those items are hidden), buyback, repair, reputation discounts, `condition_id`
+- Upgrade an existing `world.db` with `python tools/import_wotlk_db.py --dump WoTLKDB.sql --vendors-only`
+
 ### Chat + emotes
 - `CMSG_MESSAGECHAT` / `SMSG_MESSAGECHAT`: `/say`, `/yell`, `/whisper`, `/me` (emote)
 - `CMSG_TEXT_EMOTE`, `CMSG_EMOTE`, `CMSG_SET_SHEATHED`
