@@ -1,0 +1,672 @@
+"""Player spell casting, power/cooldown spend and spell effects."""
+from __future__ import annotations
+
+import random
+import struct
+import time
+
+from src.protocol.opcodes import Opcodes
+from src.world import creature
+from src.world import spells
+
+from .constants import (
+    SPELL_FAILED_BAD_TARGETS,
+    SPELL_FAILED_CASTER_AURASTATE,
+    SPELL_FAILED_CASTER_DEAD,
+    SPELL_FAILED_INTERRUPTED,
+    SPELL_FAILED_NOT_KNOWN,
+    SPELL_FAILED_NOT_READY,
+    SPELL_FAILED_NO_COMBO_POINTS,
+    SPELL_FAILED_NO_POWER,
+    SPELL_FAILED_OUT_OF_RANGE,
+    SPELL_FAILED_SPELL_IN_PROGRESS,
+    SPELL_FAILED_SPELL_UNAVAILABLE,
+)
+
+class SpellsMixin:
+    async def handle_cast_spell(self, data: bytes):
+        """``CMSG_CAST_SPELL``: the client pressed a spell.
+
+        Layout (``WorldPackets::Spells::CastSpell::Read`` -> ``SpellCastRequest``):
+        ``uint8 castId``, ``int32 spellId``, ``uint8 sendCastFlags``,
+        ``SpellTargetData`` (``uint32 flags`` + packed unit guid when one of the
+        guid flags is set), and finally a missile trajectory when
+        ``sendCastFlags & 0x2``.
+        """
+        if not self.in_world or not self.character:
+            return
+        if len(data) < 6:
+            return
+        combat = self._get_combat_state()
+        cast_id = data[0]
+        spell_id = struct.unpack_from("<i", data, 1)[0] & 0xFFFFFFFF
+        pos = 5
+        send_cast_flags = data[pos] if len(data) > pos else 0
+        pos += 1
+        target_guid = 0
+        if len(data) >= pos + 4:
+            target_flags = struct.unpack_from("<I", data, pos)[0]
+            pos += 4
+            if target_flags & 0x0F06:      # UNIT | UNIT_MINIPET | GAMEOBJECT | CORPSE
+                target_guid, pos = self._read_packed_guid(data, pos)
+        _ = send_cast_flags
+
+        if combat["dead"]:
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_CASTER_DEAD)
+            return
+        if spell_id not in self.known_spell_ids:
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NOT_KNOWN)
+            return
+        template = spells.get_spell_template(self.config.database.world_path, spell_id)
+        if template is None:
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_SPELL_UNAVAILABLE)
+            return
+        if combat["pending_cast"]:
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_SPELL_IN_PROGRESS)
+            return
+
+        now = time.monotonic()
+        if combat["cooldowns"].get(spell_id, 0.0) > now:
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NOT_READY)
+            return
+        if combat["gcd_until"] > now and template.start_recovery_time != 0:
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NOT_READY)
+            return
+
+        # A live target must be within the spell's range before anything else.
+        target_low = creature.creature_low_guid(target_guid) if target_guid else 0
+        spawn = self._get_creature_spawn(target_low) if target_low else None
+        if target_guid and not self._is_player_guid(target_guid) and spawn is None:
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_BAD_TARGETS)
+            return
+        if spawn is not None:
+            spell_range = template.get_range()
+            if spell_range < 49000.0:
+                spell_range = max(spell_range, 0.5)
+                if (self._distance(self._player_position(),
+                                   self._creature_position(target_low))
+                        > spell_range + self._melee_reach(spawn)):
+                    await self._cast_failed(cast_id, spell_id, SPELL_FAILED_OUT_OF_RANGE)
+                    return
+
+        # Finishing moves (Eviscerate, Slice and Dice, Kidney Shot, ...) need
+        # the target to be the unit the rogue already has combo points on.
+        # CMaNGOS ``Spell::CheckCast`` reports ``SPELL_FAILED_NO_COMBO_POINTS``
+        # for every class except warriors (who reuse the same attributes for
+        # Overpower's "target must be dodging" state).
+        if template.needs_combo_points():
+            target = int(target_guid or 0)
+            if not target or target != self._combo_target():
+                reason = (SPELL_FAILED_CASTER_AURASTATE
+                          if int(self.character.get("class", 1)) == 1
+                          else SPELL_FAILED_NO_COMBO_POINTS)
+                await self._cast_failed(cast_id, spell_id, reason)
+                return
+
+        cost = self._spell_power_cost(template)
+        if cost > int(self.character.get("power", self._max_power())):
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NO_POWER)
+            return
+        # Death knight abilities paid with runes use ``POWER_RUNE``.  A spell
+        # with a ``RuneCostID`` but a different power type (Death Coil costs
+        # runic power) must not touch the rune slots.
+        if (self._is_death_knight()
+                and int(template.power_type) == spells.POWER_RUNE
+                and int(getattr(template, "rune_cost_id", 0))
+                and not self._can_afford_runes(template)):
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NO_POWER)
+            return
+
+        cast = spells.SpellCast(self.player_guid, spell_id, target_guid)
+        cast.template = template
+        cast_time_ms = template.get_casting_time_ms()
+        # ``Spell::SendSpellStart`` also sets ``CAST_FLAG_NO_GCD`` for rune
+        # spells ("not needed, but B sends it"), so mirror the reference.
+        start_flags = spells.CAST_FLAG_SPELL_START
+        if (self._is_death_knight()
+                and int(template.power_type) == spells.POWER_RUNE
+                and int(getattr(template, "rune_cost_id", 0))):
+            start_flags |= spells.CAST_FLAG_NO_GCD
+
+        # Only the affordability check above happens at cast start; the cost is
+        # actually paid when the spell finishes, see :meth:`_take_power`.
+        self._start_cooldowns(template, now)
+
+        if cast_time_ms > 0:
+            await self.send_packet(
+                Opcodes.SMSG_SPELL_START,
+                spells.build_spell_start(cast, self.player_guid, target_guid,
+                                         cast_id, flags=start_flags),
+            )
+            combat["pending_cast"] = {
+                "cast_id": cast_id,
+                "spell_id": spell_id,
+                "target_guid": target_guid,
+                "template": template,
+                "finish_at": now + cast_time_ms / 1000.0,
+            }
+            return
+
+        await self.send_packet(
+            Opcodes.SMSG_SPELL_START,
+            spells.build_spell_start(cast, self.player_guid, target_guid,
+                                     cast_id, flags=start_flags),
+        )
+        # ``Spell::finish`` pays the cost (``TakePower``) and only then calls
+        # ``SendSpellGo``, so the client's predicted power in the GO packet is the
+        # value *after* the spend and there is exactly one power write per cast.
+        if not await self._take_power(template):
+            await self._cast_failed(cast_id, spell_id, SPELL_FAILED_NO_POWER)
+            return
+        # ``Spell::update`` sends GO as the cast completes and only then runs
+        # ``finish()``, so the damage/heal logs follow the packet that starts the
+        # spell's visuals.  Sending GO after the effects also reads a power
+        # value that already includes rage gained by the cast itself.
+        await self._send_spell_go(cast, template, target_guid, cast_id)
+        await self._apply_spell_effects(cast, template, target_guid)
+        # ``Spell::finish`` clears the combo points after the effects have run,
+        # so the finisher itself still scales with the full count.
+        if template.needs_combo_points():
+            await self._clear_combo_points()
+        self.log.info(
+            f"'{self.character['name']}' casts {template.name} ({spell_id})"
+        )
+
+    async def _send_spell_go(self, cast, template, target_guid: int,
+                             cast_id: int = 0) -> None:
+        """Send ``SMSG_SPELL_GO`` for ``cast`` with the 3.3.5 extras filled in.
+
+        A normal spell deliberately carries no ``CAST_FLAG_PREDICTED_POWER``.
+        CMaNGOS sets that flag for every spell with a power cost and appends
+        ``uint32 GetPower(powerType)`` -- the power *left* after ``TakePower``
+        already ran.  We send the identical number in the ``SMSG_POWER_UPDATE``
+        that ``_take_power`` emits microseconds earlier, so the field carries no
+        information the client does not already have; and the 3.3.5 client does
+        not treat it as an absolute value -- a Fireball that left 152 of 160 mana
+        came back as an empty bar, i.e. the value was *subtracted*.  Dropping the
+        field is correct under either reading, because the power-update packet
+        (which the bar demonstrably handles: it is what makes rage work) already
+        carries the post-cost value.
+
+        Death knight spells with a ``RuneCostID`` are the exception: the client
+        reads the rune masks *after* the predicted-power field, so that field has
+        to be present for ``CAST_FLAG_PREDICTED_RUNES`` to parse.  ``POWER_RUNE``
+        spells write 0 there (the core's ``GetPower(POWER_RUNE)``); runic-power
+        spells such as Death Coil omit it and rely on ``SMSG_POWER_UPDATE``.
+        """
+        combat = self._get_combat_state()
+        prediction = combat.get("rune_prediction")
+        combat["rune_prediction"] = None
+        if prediction:
+            # CMaNGOS writes ``GetPower(POWER_RUNE)`` here, which is 0 because
+            # runes are not a stored power type.  Power 5 has no visible bar,
+            # but the flag has to be present because the client reads the rune
+            # masks after the predicted-power field.  Spells such as Death Coil
+            # also carry a RuneCostID but are paid with runic power; they get
+            # the (unchanged) rune masks without a predicted-power field, so the
+            # client's runic-power bar keeps the value from SMSG_POWER_UPDATE.
+            rune_power = (0 if int(template.power_type) == spells.POWER_RUNE
+                          else None)
+            await self.send_packet(
+                Opcodes.SMSG_SPELL_GO,
+                spells.build_spell_go(
+                    cast, self.player_guid, target_guid, cast_id,
+                    timestamp_ms=self._server_tick_ms(),
+                    predicted_power=rune_power,
+                    off_gcd=True,
+                    rune_state_before=prediction["before"],
+                    rune_state_after=prediction["after"],
+                    rune_progress=prediction["progress"],
+                ),
+            )
+            return
+        await self.send_packet(
+            Opcodes.SMSG_SPELL_GO,
+            spells.build_spell_go(
+                cast, self.player_guid, target_guid, cast_id,
+                timestamp_ms=self._server_tick_ms(),
+                off_gcd=template.start_recovery_time == 0,
+            ),
+        )
+
+    async def _cast_failed(self, cast_id: int, spell_id: int, reason: int) -> None:
+        """Report a rejected cast; the client shows the matching error text."""
+        await self.send_packet(
+            Opcodes.SMSG_CAST_FAILED,
+            spells.build_cast_failed(cast_id, spell_id, reason),
+        )
+        self.log.debug(
+            f"Cast of spell {spell_id} refused (reason {reason})"
+        )
+
+    def _note_power_spend(self, template) -> None:
+        """Start the five-second mana-regen interruption after a completed cast.
+
+        ``Player::IsUnderLastManaUseEffect`` only cares about mana spends; rage
+        and energy abilities never suppress mana regeneration.  A spell with
+        ``SPELL_ATTR_EX2_DONT_BLOCK_MANA_REGEN`` (a few channeled/instant
+        utility spells) also leaves the five-second timer alone.
+        """
+        if int(template.power_type) != spells.POWER_MANA:
+            return
+        if (int(getattr(template, "attributes_ex2", 0))
+                & spells.SPELL_ATTR_EX2_DONT_BLOCK_MANA_REGEN):
+            return
+        self._get_combat_state()["last_power_use"] = time.monotonic()
+
+    def _spell_power_cost(self, template) -> int:
+        """Cost in the same units ``UNIT_FIELD_POWER1`` is stored in.
+
+        Rage spells are the interesting ones: ``Spell.dbc`` already stores the
+        rage cost in tenths (Heroic Strike is ``150`` for 15 rage) and we keep
+        rage in tenths too, so the DBC value is used as-is.  Dividing it by ten
+        was the old rage-in-points convention and made the client and the
+        server disagree about what the ability costs.
+
+        A percentage cost follows ``Spell::CalculatePowerCost`` exactly: the flat
+        ``ManaCost`` and the percentage *add up* (the core uses ``+=`` for both),
+        mana percentages are taken from :meth:`_create_mana` (``GetCreateMana``)
+        and rage/focus/energy/happiness percentages from ``GetMaxPower``.  The
+        client runs the same arithmetic to predict the cost, so anything else
+        here desynchronizes its power bar.
+        """
+        power_type = int(template.power_type)
+        # ``SPELL_ATTR_EX_USE_ALL_MANA`` (Lay on Hands) drains the whole pool
+        # instead of a fixed cost.
+        if int(getattr(template, "attributes_ex", 0)) & spells.SPELL_ATTR_EX_USE_ALL_MANA:
+            if power_type == spells.POWER_HEALTH:
+                return int(self.character.get("health", self._max_health()))
+            if power_type == spells.POWER_MANA:
+                return int(self.character.get("power", self._max_power()))
+            return 0
+        cost = int(template.mana_cost)
+        # ``CalculatePowerCost``: ``manaCostPerlevel * (GetSpellRank / 5 -
+        # baseLevel)``.  A player's spell skill is (almost always) level * 5,
+        # so ``GetSpellRank / 5`` is the character level clamped to ``maxLevel``.
+        per_level = int(getattr(template, "mana_cost_per_level", 0) or 0)
+        if per_level:
+            rank = max(1, int(self.character.get("level", 1)))
+            max_level = int(getattr(template, "max_level", 0) or 0)
+            if max_level > 0:
+                rank = min(rank, max_level)
+            cost += per_level * (rank - int(template.base_level or 0))
+        percentage = int(template.mana_cost_percentage or 0)
+        if percentage:
+            if power_type == spells.POWER_MANA:
+                basis = self._create_mana()
+            elif power_type in (spells.POWER_RAGE, spells.POWER_FOCUS,
+                                spells.POWER_ENERGY, spells.POWER_HAPPINESS):
+                basis = self._max_power()
+            else:
+                basis = 0
+            cost += int(basis * percentage / 100.0)
+        return max(0, cost)
+
+    async def _take_power(self, template) -> bool:
+        """``Spell::TakePower``: pay for a spell that is just finishing.
+
+        The real core spends power in ``Spell::finish``, right before
+        ``SendSpellGo``, never when the button was pressed.  Spending at cast
+        *start* meant the client got a power write, then watched the value crawl
+        back up from regeneration during the cast, then got a
+        ``SMSG_SPELL_GO`` that re-predicted a third number -- which is what made
+        the mana bar swing around the real cost instead of dropping by it once.
+        One write per cast, immediately before ``SMSG_SPELL_GO`` carries the
+        same number, keeps the client's prediction and ours identical.
+
+        Returns ``False`` when the player cannot afford it (a cast that started
+        while the cost was affordable can be made unaffordable by a level-up
+        changing the base pool, so this is re-checked here like the core does).
+        """
+        # ``Spell::TakePower`` delegates to ``CheckOrTakeRunePower`` only for
+        # ``POWER_RUNE`` spells.  Death Coil also carries a RuneCostID but is
+        # paid with runic power through the normal power path.
+        if (self._is_death_knight()
+                and int(template.power_type) == spells.POWER_RUNE
+                and int(getattr(template, "rune_cost_id", 0))):
+            return await self._take_runes(template)
+        cost = self._spell_power_cost(template)
+        if cost <= 0:
+            self._note_rune_prediction(template)
+            return True
+        power = int(self.character.get("power", self._max_power()))
+        if power < cost:
+            return False
+        await self._set_player_power(power - cost)
+        self._note_power_spend(template)
+        self._note_rune_prediction(template)
+        self.log.info(
+            f"'{self.character['name']}' spends {cost} for {template.name} "
+            f"({template.id}): {power} -> {self.character['power']} "
+            f"of {self._max_power()}"
+        )
+        return True
+
+    def _start_cooldowns(self, template, now: float) -> None:
+        """Record the spell's own cooldown and the global cooldown.
+
+        ``StartRecoveryTime`` *is* the GCD in 3.3.5: 1500 for a normal spell and
+        0 for spells that are off the global cooldown (Heroic Strike, Battle
+        Shout and the rest of the warrior instant toolkit).  The DBC never
+        stores an explicit value for "use the default", so a zero has to mean
+        off-GCD rather than "apply 1.5 s".
+        """
+        combat = self._get_combat_state()
+        cooldown_ms = max(int(template.recovery_time),
+                          int(template.category_recovery))
+        if cooldown_ms > 0:
+            combat["cooldowns"][template.id] = now + cooldown_ms / 1000.0
+        gcd_ms = int(template.start_recovery_time)
+        if gcd_ms > 0:
+            combat["gcd_until"] = now + gcd_ms / 1000.0
+
+    async def _apply_spell_effects(self, cast, template, target_guid: int) -> None:
+        """Roll and apply every effect of a completed cast."""
+        caster_level = int(self.character.get("level", 1))
+        player_guid = int(self.player_guid)
+        # ``WorldObject::CalculateSpellEffectValue`` adds the per-combo-point
+        # scaling only while the spell's target is the caster's combo target.
+        # Snapshot the count here so a target that dies to the first effect
+        # cannot zero the scaling of the remaining effects of the same finisher.
+        combo_points = 0
+        if target_guid and int(target_guid) == self._combo_target():
+            combo_points = self._combo_points()
+        for index, effect in enumerate(template.effects):
+            etype = int(effect["effect"])
+            if not etype:
+                continue
+            if etype == spells.SPELL_EFFECT_SCHOOL_DAMAGE:
+                if not target_guid:
+                    continue
+                amount = template.effect_value(index, caster_level, combo_points)
+                if amount <= 0:
+                    continue
+                await self._deal_damage_to_target(
+                    target_guid, amount, template.school, template.id, player_guid
+                )
+            elif etype in (spells.SPELL_EFFECT_WEAPON_DAMAGE,
+                           spells.SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL,
+                           spells.SPELL_EFFECT_NORMALIZED_WEAPON_DMG):
+                if not target_guid:
+                    continue
+                weapon = self._player_weapon_stats()
+                amount = int(random.uniform(weapon["min"], weapon["max"]))
+                amount += template.effect_value(index, caster_level, combo_points)
+                amount += max(1, int(caster_level * 0.5))
+                await self._deal_damage_to_target(
+                    target_guid, max(1, amount), 1, template.id, player_guid
+                )
+            elif etype == spells.SPELL_EFFECT_ATTACK:
+                if not target_guid:
+                    continue
+                weapon = self._player_weapon_stats()
+                amount = int(random.uniform(weapon["min"], weapon["max"]))
+                amount += max(1, int(caster_level * 0.5))
+                await self._send_attacker_state_update(
+                    player_guid, target_guid, max(1, amount)
+                )
+                await self._deal_damage_to_target(
+                    target_guid, max(1, amount), 1, template.id, player_guid
+                )
+            elif etype in (spells.SPELL_EFFECT_HEAL,
+                           spells.SPELL_EFFECT_HEAL_MAX_HEALTH):
+                amount = template.effect_value(index, caster_level, combo_points)
+                if amount <= 0:
+                    continue
+                healed, overheal = await self._heal_player(amount)
+                await self._send_spell_heal_log(
+                    target_guid or player_guid, player_guid, template.id,
+                    healed, overheal,
+                )
+            elif etype == spells.SPELL_EFFECT_HEALTH_LEECH:
+                if not target_guid:
+                    continue
+                amount = template.effect_value(index, caster_level, combo_points)
+                if amount <= 0:
+                    continue
+                await self._deal_damage_to_target(
+                    target_guid, amount, template.school, template.id, player_guid
+                )
+                healed, _ = await self._heal_player(amount)
+                await self._send_spell_heal_log(
+                    player_guid, player_guid, template.id, healed, 0
+                )
+            elif etype == spells.SPELL_EFFECT_INSTAKILL:
+                if target_guid:
+                    await self._deal_damage_to_target(
+                        target_guid, 1 << 24, template.school, template.id,
+                        player_guid,
+                    )
+            elif etype == spells.SPELL_EFFECT_TRIGGER_SPELL:
+                triggered = int(effect["trigger_spell"])
+                if triggered:
+                    await self._cast_triggered(triggered, target_guid)
+            elif etype == spells.SPELL_EFFECT_ADD_COMBO_POINTS:
+                # ``Spell::EffectAddComboPoints``: the effect's own rolled value
+                # is the number of points added (Sinister Strike adds 1).
+                if not target_guid:
+                    continue
+                points = template.effect_value(index, caster_level)
+                if points > 0:
+                    await self._add_combo_points(target_guid, points)
+            elif etype == spells.SPELL_EFFECT_APPLY_AURA:
+                self._apply_periodic_aura(template, effect, index, caster_level,
+                                          target_guid, combo_points)
+
+    async def _cast_triggered(self, spell_id: int, target_guid: int) -> None:
+        """Cast a triggered spell immediately, ignoring costs and cooldowns."""
+        template = spells.get_spell_template(self.config.database.world_path,
+                                             spell_id)
+        if template is None:
+            return
+        cast = spells.SpellCast(self.player_guid, spell_id, target_guid)
+        cast.template = template
+        await self.send_packet(
+            Opcodes.SMSG_SPELL_START,
+            spells.build_spell_start(cast, self.player_guid, target_guid, 0),
+        )
+        await self._send_spell_go(cast, template, target_guid, 0)
+        await self._apply_spell_effects(cast, template, target_guid)
+
+    def _apply_periodic_aura(self, template, effect, index: int,
+                             caster_level: int, target_guid: int,
+                             combo_points: int = 0) -> None:
+        """Register a damage/heal over-time effect on the target."""
+        aura = int(effect["apply_aura"])
+        if aura not in (spells.SPELL_AURA_PERIODIC_DAMAGE,
+                        spells.SPELL_AURA_PERIODIC_HEAL,
+                        spells.SPELL_AURA_PERIODIC_LEECH):
+            return
+        if not target_guid:
+            return
+        amplitude = max(1, int(effect["amplitude"] or 2000)) // 1000
+        amount = template.effect_value(index, caster_level, combo_points)
+        if amount <= 0:
+            return
+        # ``SpellDuration.dbc`` is not imported, so a periodic aura simply runs
+        # for 15 s; re-casting refreshes it.
+        now = time.monotonic()
+        combat = self._get_combat_state()
+        combat["dots"].append({
+            "target_guid": int(target_guid),
+            "spell_id": int(template.id),
+            "amount": amount,
+            "school": int(template.school),
+            "interval": float(amplitude),
+            "next_tick": now + float(amplitude),
+            "expires": now + 15.0,
+            "is_heal": aura == spells.SPELL_AURA_PERIODIC_HEAL,
+        })
+
+    async def _deal_damage_to_target(self, target_guid: int, damage: int,
+                                     school: int, spell_id: int,
+                                     caster_guid: int) -> None:
+        """Damage a creature (or the player) and write the combat-log packet."""
+        if self._is_player_guid(target_guid):
+            await self._damage_player(damage, f"spell {spell_id}")
+            return
+        died = await self._deal_damage_to_creature(target_guid, damage, caster_guid)
+        await self._send_spell_damage_log(
+            target_guid, caster_guid, spell_id, damage, school or 1
+        )
+
+    async def _apply_pending_cast(self, pending: dict) -> None:
+        """Finish a cast whose casting time has elapsed."""
+        template = pending["template"]
+        target_guid = pending["target_guid"]
+        cast = spells.SpellCast(self.player_guid, pending["spell_id"], target_guid)
+        cast.template = template
+        # ``Spell::update`` -> ``finish``: pay for the spell, then tell the
+        # client it went off.  Both the ``SMSG_POWER_UPDATE`` from the spend and
+        # the predicted power inside ``SMSG_SPELL_GO`` therefore carry the same
+        # post-cost number, which is what keeps the client's bar from jumping.
+        # The five-second regen rule starts here too (patch 1.4.0), not at cast
+        # start, and a spell that cannot be paid for any more simply does not go
+        # off (the client still has to be told, hence the GO we skip).
+        if not await self._take_power(template):
+            await self._cast_failed(pending["cast_id"], template.id,
+                                    SPELL_FAILED_NO_POWER)
+            self.log.info(
+                f"'{self.character['name']}' could not pay for "
+                f"{template.name} ({pending['spell_id']})"
+            )
+            return
+        await self._send_spell_go(cast, template, target_guid,
+                                  pending["cast_id"])
+        await self._apply_spell_effects(cast, template, target_guid)
+        if template.needs_combo_points():
+            await self._clear_combo_points()
+        self.log.info(
+            f"'{self.character['name']}' finishes {template.name} "
+            f"({pending['spell_id']})"
+        )
+
+    async def _apply_dot_tick(self, dot: dict) -> None:
+        """One periodic tick."""
+        amount = int(dot["amount"])
+        target_guid = int(dot["target_guid"])
+        # Player casts tag the dot with the player; creature spells carry their
+        # own caster guid so the combat log names the right source.
+        caster_guid = int(dot.get("caster_guid") or self.player_guid)
+        if dot["is_heal"]:
+            if self._is_player_guid(target_guid):
+                healed, _ = await self._heal_player(amount)
+                await self._send_spell_heal_log(
+                    target_guid, caster_guid, dot["spell_id"], healed, 0,
+                )
+            return
+        if self._is_player_guid(target_guid):
+            await self._damage_player(amount, f"periodic {dot['spell_id']}")
+            await self._send_spell_damage_log(
+                target_guid, caster_guid, dot["spell_id"], amount,
+                dot["school"] or 1, periodic=1,
+            )
+            return
+        died = await self._deal_damage_to_creature(target_guid, amount,
+                                                   caster_guid)
+        await self._send_spell_damage_log(
+            target_guid, caster_guid, dot["spell_id"], amount,
+            dot["school"] or 1, periodic=1,
+        )
+        if died:
+            dot["expires"] = 0.0
+
+    async def handle_cancel_cast(self, data: bytes):
+        """``CMSG_CANCEL_CAST``: interrupt the spell being cast."""
+        if len(data) < 4:
+            return
+        spell_id = struct.unpack_from("<I", data, 0)[0]
+        combat = self._get_combat_state()
+        pending = combat["pending_cast"]
+        if pending and pending["spell_id"] == spell_id:
+            await self.send_packet(
+                Opcodes.SMSG_SPELL_FAILURE,
+                spells.build_spell_failure(self.player_guid, pending["cast_id"],
+                                           spell_id, SPELL_FAILED_INTERRUPTED),
+            )
+            combat["pending_cast"] = None
+            self.log.debug(f"Cancelled cast of spell {spell_id}")
+
+    async def handle_set_selection(self, data: bytes):
+        """``CMSG_SET_SELECTION``: the client selected a target."""
+        if len(data) >= 8:
+            guid = struct.unpack_from("<Q", data, 0)[0]
+            combat = self._get_combat_state()
+            combat["selected_guid"] = guid
+
+    async def _send_spell_damage_log(self, victim_guid: int, caster_guid: int,
+                                     spell_id: int, damage: int, school: int,
+                                     periodic: int = 0, critical: int = 0) -> None:
+        """Send ``SMSG_SPELLNONMELEEDAMAGELOG`` (overkill/absorb/resist = 0)."""
+        out = bytearray()
+        out += spells.pack_guid(int(victim_guid))
+        out += spells.pack_guid(int(caster_guid))
+        out += struct.pack("<ii", int(spell_id) & 0xFFFFFFFF, int(damage))
+        out += struct.pack("<i", 0)                  # overkill
+        out += struct.pack("<B", school & 0xFF)      # school mask
+        out += struct.pack("<I", 0)                  # absorbed
+        out += struct.pack("<I", 0)                  # resisted
+        out += struct.pack("<B", periodic & 0xFF)
+        out += struct.pack("<B", 0)                  # unused
+        out += struct.pack("<I", 0)                  # shield block
+        out += struct.pack("<I", 2 if critical else 0)  # SPELL_HIT_TYPE_CRIT
+        out += struct.pack("<B", 0)                  # no debug info
+        await self.send_packet(Opcodes.SMSG_SPELLNONMELEEDAMAGELOG, bytes(out))
+
+    async def _send_spell_heal_log(self, target_guid: int, healer_guid: int,
+                                   spell_id: int, heal: int, overheal: int,
+                                   critical: bool = False) -> None:
+        """Send ``SMSG_SPELLHEALLOG`` for a direct heal."""
+        out = bytearray()
+        out += spells.pack_guid(int(target_guid))
+        out += spells.pack_guid(int(healer_guid))
+        out += struct.pack("<I", int(spell_id) & 0xFFFFFFFF)
+        out += struct.pack("<I", int(heal) & 0xFFFFFFFF)
+        out += struct.pack("<I", int(overheal) & 0xFFFFFFFF)
+        out += struct.pack("<I", 0)                  # absorbed
+        out += struct.pack("<B", 1 if critical else 0)
+        out += struct.pack("<B", 0)                  # unused
+        await self.send_packet(Opcodes.SMSG_SPELLHEALLOG, bytes(out))
+
+    async def _send_attacker_state_update(self, attacker_guid: int, victim_guid: int,
+                                          damage: int, is_miss: bool = False,
+                                          is_crit: bool = False,
+                                          school: int = 1) -> None:
+        """Send ``SMSG_ATTACKERSTATEUPDATE`` for one melee hit.
+
+        Layout from CMaNGOS 3.3.5 ``Unit::SendAttackStateUpdate``: ``uint32
+        flags``, packed attacker, packed victim, ``uint32 damage``, ``uint32
+        overdamage``, ``uint8 subcount``, then per sub-damage ``uint32
+        schoolMask, float fDamage, uint32 damage``, ``uint8 victimState``,
+        ``uint32 attackerState``, ``uint32 meleeSpellId``.
+
+        ``overdamage`` is ``max(0, damage - victim_health)`` measured *before*
+        the damage is applied -- the newer core's ``-1`` sentinel is a post-3.3.5
+        convention and the 3.3.5 client renders it as a nonsense overkill value.
+        """
+        flags = 0
+        victim_state = 0
+        if not is_miss:
+            flags |= 0x00000002          # HITINFO_AFFECTS_VICTIM
+            victim_state = 1             # VICTIMSTATE_HIT
+            if is_crit:
+                flags |= 0x00000200      # HITINFO_CRITICALHIT
+        else:
+            flags |= 0x00000010          # HITINFO_MISS
+
+        overkill = max(0, int(damage) - self._victim_health(victim_guid)) if not is_miss else 0
+
+        out = bytearray()
+        out += struct.pack("<I", flags)
+        out += spells.pack_guid(int(attacker_guid))
+        out += spells.pack_guid(int(victim_guid))
+        out += struct.pack("<I", damage & 0xFFFFFFFF)
+        out += struct.pack("<I", overkill & 0xFFFFFFFF)
+        out += struct.pack("<B", 1)      # one sub-damage entry
+        out += struct.pack("<I", school & 0xFF)
+        out += struct.pack("<f", float(damage))
+        out += struct.pack("<I", damage & 0xFFFFFFFF)
+        out += struct.pack("<B", victim_state)
+        out += struct.pack("<I", 0)      # attacker state
+        out += struct.pack("<I", 0)      # melee spell id
+        await self.send_packet(Opcodes.SMSG_ATTACKERSTATEUPDATE, bytes(out))

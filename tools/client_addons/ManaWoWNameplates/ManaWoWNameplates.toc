@@ -1,0 +1,5 @@
+## Interface: 30300
+## Title: ManaWoW Nameplates
+## Notes: Turns on nameplates for friendly NPCs, enemies, pets, guardians and totems so NPC names show without clicking. Roles stay in the mouseover tooltip, like vanilla.
+## Version: 1.0
+ManaWoWNameplates.lua

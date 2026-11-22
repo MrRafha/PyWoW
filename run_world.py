@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+
+from src.common.config import Config
+from src.common.utils import ensure_dirs, pause_if_interactive
+from src.world.server import WorldServer
+
+
+async def main():
+    cfg_path = os.path.join(os.path.dirname(__file__), "config", "config.yaml")
+    if not os.path.exists(cfg_path):
+        cfg_path = os.path.join(os.path.dirname(__file__), "config", "config.example.yaml")
+        print(f"config.yaml not found; using {cfg_path}")
+    cfg = Config.load(cfg_path)
+    ensure_dirs(os.path.dirname(cfg.database.auth_path), os.path.dirname(cfg.database.world_path), cfg.logging.log_dir)
+    server = WorldServer(cfg)
+    await server.start()
+    await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except SystemExit:
+        pause_if_interactive()
+        raise
+    except KeyboardInterrupt:
+        pass
